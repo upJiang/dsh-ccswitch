@@ -21,6 +21,8 @@ export interface CcSwitchRoute {
   readonly protocol: CcSwitchProtocol
   readonly defaultModel: string
   readonly models: readonly CcSwitchModel[]
+  /** Fields explicitly supplied by CC Switch for each configured model. */
+  readonly modelOverrides?: ReadonlyMap<string, CcSwitchModelOverrides>
   readonly authKind: CcSwitchAuthKind
   readonly accountId?: string
   readonly fingerprint: string
@@ -32,6 +34,8 @@ export interface CcSwitchModel {
   readonly contextWindow: number
   readonly maxTokens: number
 }
+
+export type CcSwitchModelOverrides = Partial<Pick<CcSwitchModel, 'name' | 'contextWindow' | 'maxTokens'>>
 
 export interface CcSwitchCredential {
   readonly token?: string

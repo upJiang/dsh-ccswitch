@@ -10,7 +10,10 @@ function text(value: unknown): string | undefined {
 }
 
 function positive(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
+  const numeric = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && value.trim().length > 0 ? Number(value.trim()) : NaN
+  return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : undefined
 }
 
 function listURL(route: CcSwitchRoute): string {
@@ -60,13 +63,15 @@ function entries(body: unknown): unknown[] {
 
 function parseModel(route: CcSwitchRoute, value: unknown): CcSwitchModel | undefined {
   const record = value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
-  const id = text(record.slug) ?? text(record.id) ?? text(record.model) ?? text(record.name)?.replace(/^models\//, '')
+  const id = text(record.slug) ?? text(record.id) ?? text(record.model) ?? text(record.name)
   if (id === undefined) return undefined
   const contextWindow = positive(record.context_window) ?? positive(record.contextWindow)
     ?? positive(record.context_length) ?? positive(record.input_token_limit) ?? DEFAULT_CONTEXT_WINDOW
   const maxTokens = positive(record.max_output_tokens) ?? positive(record.maxTokens)
     ?? positive(record.output_token_limit) ?? DEFAULT_MAX_TOKENS
-  return { id: id.replace(/^models\//, ''), name: text(record.display_name) ?? text(record.displayName) ?? id, contextWindow, maxTokens }
+  const modelId = route.appType === 'gemini' ? id.replace(/^models\//, '').trim() : id
+  if (modelId.length === 0) return undefined
+  return { id: modelId, name: text(record.display_name) ?? text(record.displayName) ?? modelId, contextWindow, maxTokens }
 }
 
 function authHeaders(route: CcSwitchRoute, credential: CcSwitchCredential): Record<string, string> {

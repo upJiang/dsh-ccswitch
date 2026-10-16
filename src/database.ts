@@ -6,6 +6,7 @@ import type {
   CcSwitchAuthKind,
   CcSwitchConfig,
   CcSwitchModel,
+  CcSwitchModelOverrides,
   CcSwitchReasoningEffort,
   CcSwitchRoute,
   CcSwitchSnapshot,
@@ -105,21 +106,29 @@ function codexConfigValue(config: string, key: string): string | undefined {
   return nonEmpty(match?.[1])
 }
 
-function codexProviderConfig(config: string): { baseURL?: string; protocol?: 'openai-completions' | 'openai-responses' } {
+function codexProviderConfig(config: string, apiFormat: string | undefined): { baseURL?: string; protocol?: 'openai-completions' | 'openai-responses' } {
   const providerId = codexConfigValue(config, 'model_provider')
-  if (providerId === undefined) return {}
-  const section = config.match(
+  const section = providerId === undefined ? '' : config.match(
     // Do not use the multiline flag here: `$` must mean end-of-config, not
     // the end of the provider header line.
     new RegExp(`\\[model_providers\\.${escapeRegExp(providerId)}\\]([\\s\\S]*?)(?=\\n\\[|$)`),
   )?.[1] ?? ''
   const baseURL = codexConfigValue(section, 'base_url')
   const wireApi = codexConfigValue(section, 'wire_api')
+  // CC Switch keeps Codex's wire_api=responses even when the selected
+  // upstream only speaks Chat Completions. Its local proxy performs the
+  // Responses <-> Chat conversion. DSH must honor the provider's actual
+  // upstream format when bypassing that proxy.
+  const protocol = apiFormat === 'openai_chat'
+    ? 'openai-completions'
+    : apiFormat === 'openai_responses'
+      ? 'openai-responses'
+      : wireApi === 'chat' || wireApi === 'completions'
+        ? 'openai-completions'
+        : 'openai-responses'
   return {
     ...(baseURL === undefined ? {} : { baseURL }),
-    protocol: wireApi === 'chat' || wireApi === 'completions'
-      ? 'openai-completions'
-      : 'openai-responses',
+    protocol,
   }
 }
 
@@ -127,16 +136,84 @@ function stripGeminiModelPrefix(id: string): string {
   return id.replace(/^models\//, '').trim()
 }
 
+function normalizeModelId(appType: CcSwitchAppType, id: string): string {
+  return appType === 'gemini' ? stripGeminiModelPrefix(id) : id.trim()
+}
+
+function modelCatalogEntries(settings: Record<string, unknown>): unknown[] {
+  const raw = settings.modelCatalog
+  const catalog = objectValue(raw)
+  return Array.isArray(catalog.models) ? catalog.models : []
+}
+
+function positiveCatalogNumber(value: unknown): number | undefined {
+  const numeric = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && value.trim().length > 0 ? Number(value.trim()) : NaN
+  return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : undefined
+}
+
 function defaultModel(settings: Record<string, unknown>, appType: CcSwitchAppType): string {
   const env = objectValue(settings.env)
+  let catalogId: string | undefined
+  for (const value of modelCatalogEntries(settings)) {
+    const item = objectValue(value)
+    const id = nonEmpty(item.model) ?? nonEmpty(item.id)
+    if (id !== undefined) {
+      const normalizedId = normalizeModelId(appType, id)
+      if (normalizedId.length > 0) {
+        catalogId = normalizedId
+        break
+      }
+    }
+  }
   const value = appType === 'claude'
     ? nonEmpty(settings.model) ?? nonEmpty(env.ANTHROPIC_MODEL)
     : appType === 'codex'
       ? codexConfigValue(nonEmpty(settings.config) ?? '', 'model')
       : nonEmpty(env.GEMINI_MODEL) ?? nonEmpty(settings.model)
-  return value ?? (appType === 'claude'
+  return value ?? catalogId ?? (appType === 'claude'
     ? 'claude-sonnet-4-5'
     : appType === 'codex' ? 'gpt-5.5' : 'gemini-2.5-flash')
+}
+
+function configuredModels(
+  settings: Record<string, unknown>,
+  appType: CcSwitchAppType,
+  fallback: string,
+): { models: CcSwitchModel[]; modelOverrides: ReadonlyMap<string, CcSwitchModelOverrides> } {
+  const raw = modelCatalogEntries(settings)
+  const unique = new Map<string, CcSwitchModel>()
+  const modelOverrides = new Map<string, CcSwitchModelOverrides>()
+  for (const value of raw) {
+    const item = objectValue(value)
+    const id = nonEmpty(item.model) ?? nonEmpty(item.id)
+    if (id === undefined) continue
+    const normalizedId = normalizeModelId(appType, id)
+    if (normalizedId.length === 0) continue
+    if (unique.has(normalizedId)) continue
+    const configuredName = nonEmpty(item.displayName) ?? nonEmpty(item.display_name)
+    const configuredContextWindow = positiveCatalogNumber(item.contextWindow)
+      ?? positiveCatalogNumber(item.context_window)
+    const configuredMaxTokens = positiveCatalogNumber(item.maxTokens)
+    unique.set(normalizedId, {
+      id: normalizedId,
+      name: configuredName ?? normalizedId,
+      contextWindow: configuredContextWindow ?? DEFAULT_CONTEXT_WINDOW,
+      maxTokens: configuredMaxTokens ?? DEFAULT_MAX_TOKENS,
+    })
+    const overrides: CcSwitchModelOverrides = {
+      ...(configuredName === undefined ? {} : { name: configuredName }),
+      ...(configuredContextWindow === undefined ? {} : { contextWindow: configuredContextWindow }),
+      ...(configuredMaxTokens === undefined ? {} : { maxTokens: configuredMaxTokens }),
+    }
+    if (Object.keys(overrides).length > 0) modelOverrides.set(normalizedId, overrides)
+  }
+  const fallbackId = normalizeModelId(appType, fallback)
+  if (fallbackId.length > 0 && !unique.has(fallbackId)) {
+    unique.set(fallbackId, { id: fallbackId, name: fallbackId, contextWindow: DEFAULT_CONTEXT_WINDOW, maxTokens: DEFAULT_MAX_TOKENS })
+  }
+  return { models: [...unique.values()], modelOverrides }
 }
 
 function parseConfiguredAuth(
@@ -178,7 +255,13 @@ function routeFromRow(row: ProviderRow, endpoint: string | undefined): { route: 
   const providerType = nonEmpty(row.provider_type)
     ?? nonEmpty(meta.providerType)
     ?? nonEmpty(meta.provider_type)
-  const codex = appType === 'codex' ? codexProviderConfig(nonEmpty(settings.config) ?? '') : {}
+  const apiFormat = appType === 'codex'
+    ? nonEmpty(meta.apiFormat)
+      ?? nonEmpty(meta.api_format)
+      ?? nonEmpty(settings.api_format)
+      ?? nonEmpty(settings.apiFormat)
+    : undefined
+  const codex = appType === 'codex' ? codexProviderConfig(nonEmpty(settings.config) ?? '', apiFormat) : {}
   const auth = parseConfiguredAuth(settings, meta, appType, providerType)
   const hasInlineCredential = appType === 'claude'
     ? envValue(settings, 'ANTHROPIC_AUTH_TOKEN') !== undefined
@@ -206,6 +289,7 @@ function routeFromRow(row: ProviderRow, endpoint: string | undefined): { route: 
   if (baseURL === undefined) return undefined
 
   const model = defaultModel(settings, appType)
+  const configured = configuredModels(settings, appType, model)
   const sourceId = row.id.trim()
   if (sourceId.length === 0 || model.length === 0) return undefined
   const route: CcSwitchRoute = {
@@ -217,13 +301,9 @@ function routeFromRow(row: ProviderRow, endpoint: string | undefined): { route: 
     protocol: appType === 'claude'
       ? 'anthropic-messages'
       : appType === 'gemini' ? 'google-generative-ai' : codex.protocol ?? 'openai-responses',
-    defaultModel: stripGeminiModelPrefix(model),
-    models: [{
-      id: stripGeminiModelPrefix(model),
-      name: stripGeminiModelPrefix(model),
-      contextWindow: DEFAULT_CONTEXT_WINDOW,
-      maxTokens: DEFAULT_MAX_TOKENS,
-    }],
+    defaultModel: normalizeModelId(appType, model),
+    models: configured.models,
+    ...(configured.modelOverrides.size === 0 ? {} : { modelOverrides: configured.modelOverrides }),
     authKind: auth.kind,
     ...(auth.accountId === undefined ? {} : { accountId: auth.accountId }),
     fingerprint: hash({

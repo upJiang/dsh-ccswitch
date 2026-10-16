@@ -23,7 +23,7 @@ interface Snapshot {
   routes: ReadonlyMap<string, CcSwitchRoute>
 }
 
-function requestHeaders(route: CcSwitchRoute, token: string, extra: Readonly<Record<string, string>> | undefined): Record<string, string | null> {
+export function requestHeaders(route: CcSwitchRoute, token: string, extra: Readonly<Record<string, string>> | undefined): Record<string, string | null> {
   const headers: Record<string, string | null> = { ...extra }
   if (route.authKind === 'claude-token') {
     headers.authorization = `Bearer ${token}`
@@ -35,6 +35,20 @@ function requestHeaders(route: CcSwitchRoute, token: string, extra: Readonly<Rec
     headers.authorization = `Bearer ${token}`
     if (route.accountId !== undefined) headers['chatgpt-account-id'] = route.accountId
     headers.originator = 'cc-switch'
+  }
+  // AgentRouter currently gates generic HTTP clients behind a recognized
+  // Codex client fingerprint. CC Switch's own Codex path supplies this
+  // identity, so preserve the same compatibility when DSH talks to the
+  // upstream directly rather than through CC Switch's local proxy.
+  if (route.appType === 'codex') {
+    try {
+      const host = new URL(route.baseURL).hostname.toLowerCase()
+      if (host === 'agentrouter.org' || host.endsWith('.agentrouter.org')) {
+        if (!Object.keys(headers).some(key => key.toLowerCase() === 'originator')) headers.originator = 'codex_cli_rs'
+      }
+    } catch {
+      // Invalid URLs are handled by the transport later.
+    }
   }
   const attribution = attributionHeaders()
   const reserved = new Set(Object.keys(attribution).map(key => key.toLowerCase()))
@@ -94,13 +108,33 @@ export class CcSwitchAdapter extends LlmAdapter {
   /** Publish endpoint-discovered models without touching the CC Switch DB. */
   setDiscoveredModels(provider: string, models: readonly CcSwitchModel[]): void {
     if (models.length === 0) return
+    const route = this.repository.current.routes.find(route => route.provider === provider)
+    const configured = route?.models ?? []
+    const overrides = route?.modelOverrides
+    const merged = new Map(models.map(model => [model.id, model]))
+    for (const model of configured) {
+      const discovered = merged.get(model.id)
+      if (discovered === undefined) {
+        merged.set(model.id, model)
+        continue
+      }
+      const explicit = overrides?.get(model.id)
+      merged.set(model.id, {
+        ...discovered,
+        ...(explicit?.name === undefined ? {} : { name: explicit.name }),
+        ...(explicit?.contextWindow === undefined ? {} : { contextWindow: explicit.contextWindow }),
+        ...(explicit?.maxTokens === undefined ? {} : { maxTokens: explicit.maxTokens }),
+      })
+    }
+    const next = [...merged.values()]
     const previous = this.discovered.get(provider)
-    const same = previous !== undefined && previous.length === models.length
-      && previous.every((model, index) => model.id === models[index]?.id
-        && model.contextWindow === models[index]?.contextWindow
-        && model.maxTokens === models[index]?.maxTokens)
+    const same = previous !== undefined && previous.length === next.length
+      && previous.every((model, index) => model.id === next[index]?.id
+        && model.name === next[index]?.name
+        && model.contextWindow === next[index]?.contextWindow
+        && model.maxTokens === next[index]?.maxTokens)
     if (same) return
-    this.discovered.set(provider, models.map(model => ({ ...model })))
+    this.discovered.set(provider, next.map(model => ({ ...model })))
     this.discoveredRevision += 1
     this.snapshot = undefined
   }
